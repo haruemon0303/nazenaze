@@ -59,6 +59,42 @@ async function callLLM(prompt, context) {
 }
 
 /**
+ * 候補更新専用：文脈に沿った質問候補のみを取得
+ * @param {Array} context 会話履歴（このアプリ内の形式）
+ * @returns {Promise<Array<{short:string, full:string}>>} 候補3つ、失敗時はnull
+ */
+async function callSuggestionsOnly(context) {
+  try {
+    const history = buildWorkerHistory(context, 8);
+
+    // 候補生成専用プロンプト
+    const prompt =
+      "直近の話題を踏まえて、次にユーザーが選びやすい「さら問い」候補を3つだけ提案してください。" +
+      "短く具体的に。重複禁止。出力はsuggestionsに3つ。answerは1文で短くて良い。";
+
+    const res = await fetch(WORKER_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question: prompt, history }),
+    });
+
+    if (!res.ok) return null;
+
+    const data = await res.json();
+    const suggestionsText = Array.isArray(data.suggestions) ? data.suggestions : [];
+
+    if (suggestionsText.length < 3) return null;
+
+    // UI用に変換（品質ガードは normalizeSuggestionsToUI で実施）
+    const suggestions = normalizeSuggestionsToUI(suggestionsText, context);
+    return suggestions;
+  } catch (error) {
+    console.error("Error in callSuggestionsOnly:", error);
+    return null;
+  }
+}
+
+/**
  * このアプリの履歴（{question,answer,timestamp}）を
  * Workersが期待する [{role, content}] に変換する
  */
@@ -85,9 +121,9 @@ function buildWorkerHistory(appHistory, limit = 8) {
 
 /**
  * Workersから返ってくる suggestions: [string,string,string] を
- * UI用 [{short, full}] に変換
+ * UI用 [{short, full}] に変換（品質ガード付き）
  */
-function normalizeSuggestionsToUI(suggestionsText) {
+function normalizeSuggestionsToUI(suggestionsText, context = null) {
   const fallback = [
     { short: "前提は？", full: "この話の前提条件は何？" },
     { short: "具体例は？", full: "具体例で説明して" },
@@ -100,35 +136,93 @@ function normalizeSuggestionsToUI(suggestionsText) {
   const s1 = String(suggestionsText[1] ?? "").trim();
   const s2 = String(suggestionsText[2] ?? "").trim();
 
+  // 空チェック
   if (!s0 || !s1 || !s2) return fallback;
 
+  // 重複チェック（完全一致）
   const uniq = Array.from(new Set([s0, s1, s2]));
   if (uniq.length < 3) return fallback;
 
-  return [
-    { short: shortenSuggestion(s0), full: s0 },
-    { short: shortenSuggestion(s1), full: s1 },
-    { short: shortenSuggestion(s2), full: s2 },
-  ];
+  // 意味的重複チェック（記号除去＆小文字化して比較）
+  const normalized = [s0, s1, s2].map(normalizeForComparison);
+  const uniqNormalized = Array.from(new Set(normalized));
+  if (uniqNormalized.length < 3) {
+    // 重複あり → 再生成を試みる（ただし無限ループ防止）
+    console.warn("Detected duplicate suggestions, using fallback");
+    return fallback;
+  }
+
+  // 極端に長い候補（80文字超）の処理
+  const results = [s0, s1, s2].map((full) => {
+    let processedFull = full;
+    // 80文字超の場合でもfullはそのまま保持（送信時に使う）
+    if (full.length > 80) {
+      console.warn(`Long suggestion detected (${full.length} chars): ${full.slice(0, 30)}...`);
+      // shortは安全に省略
+    }
+    return {
+      short: shortenSuggestion(full),
+      full: processedFull,
+    };
+  });
+
+  return results;
 }
 
 /**
- * ボタン表示を短くする（長すぎるとUIが崩れる）
+ * 候補を正規化して重複チェック用に比較しやすくする
+ */
+function normalizeForComparison(text) {
+  return String(text)
+    .toLowerCase()
+    .replace(/[？?！!、。,.\s]/g, "")
+    .replace(/[ぁ-ん]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 0x60)); // ひらがな→カタカナ
+}
+
+/**
+ * ボタン表示を短くする（意味を保持しながら18-22文字に短縮）
  */
 function shortenSuggestion(text) {
-  // 「（例：...）」などの補足を削る
-  let t = text.replace(/（[^）]*）/g, "").trim();
+  // 1) 先頭/末尾の空白除去
+  let t = String(text).trim();
 
-  // 長すぎる場合は省略
-  const MAX = 12;
+  // 2) 「（...）」「［...］」「例：...」などの補足を除去
+  t = t.replace(/（[^）]*）/g, "");
+  t = t.replace(/\([^)]*\)/g, "");
+  t = t.replace(/\[[^\]]*\]/g, "");
+  t = t.replace(/例：[^、。？]*[、。]?/g, "");
+  t = t.trim();
+
+  // 3) 句点/読点/「：」以降を切って主節を優先
+  // ただし元が短い場合はそのまま
+  if (t.length > 22) {
+    const cutPoints = [
+      t.indexOf("。"),
+      t.indexOf("、"),
+      t.indexOf("："),
+      t.indexOf(":"),
+    ].filter((i) => i > 0);
+
+    if (cutPoints.length > 0) {
+      const firstCut = Math.min(...cutPoints);
+      // 切った結果が短すぎない場合のみ適用
+      if (firstCut >= 10 && firstCut <= 22) {
+        t = t.slice(0, firstCut);
+      }
+    }
+  }
+
+  // 4) 最大18〜22文字。それ以上は省略記号
+  const MAX = 22;
   if (t.length > MAX) {
     t = t.slice(0, MAX) + "…";
   }
 
-  // 末尾に？がないなら付ける（選択肢っぽさ）
+  // 5) 末尾に？がないなら付ける（選択肢っぽさ）
   if (!t.endsWith("？") && !t.endsWith("?")) {
     t = t + "？";
   }
+
   return t;
 }
 
@@ -352,10 +446,33 @@ async function handleSend() {
 }
 
 /**
- * 更新ボタンの処理（候補を入れ替え）
+ * 更新ボタンの処理（文脈に沿った候補更新）
  */
-function handleRefresh() {
+async function handleRefresh() {
+  const refreshBtn = document.getElementById("refreshBtn");
   const base = conversationHistory[0] || null;
+
+  // 会話履歴がある場合は、Workers APIで文脈に沿った候補を取得
+  if (base && conversationHistory.length > 0) {
+    try {
+      // ボタンを一時的に無効化（連打防止）
+      refreshBtn.disabled = true;
+
+      const contextSuggestions = await callSuggestionsOnly(conversationHistory);
+
+      if (contextSuggestions && contextSuggestions.length === 3) {
+        updateSuggestions(contextSuggestions);
+        refreshBtn.disabled = false;
+        return;
+      }
+    } catch (error) {
+      console.error("Error fetching context suggestions:", error);
+    } finally {
+      refreshBtn.disabled = false;
+    }
+  }
+
+  // フォールバック：ランダムな候補
   const newSuggestions = generateRandomSuggestions(base);
   updateSuggestions(newSuggestions);
 }
